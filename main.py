@@ -10,8 +10,10 @@ from PyQt6.QtWidgets import (
     QGraphicsView,
     QGraphicsScene,
     QGraphicsPathItem,
+    QGraphicsRectItem,
+    QGraphicsItem,
 )
-from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtCore import Qt, QRectF, QPointF, QLineF
 from PyQt6.QtGui import (
     QPixmap,
     QPainter,
@@ -22,6 +24,7 @@ from PyQt6.QtGui import (
     QLinearGradient,
     QPainterPath,
     QRadialGradient,
+    QTransform,
 )
 
 # --- STYLING ---
@@ -50,6 +53,72 @@ BUTTON_STYLE = """
     }
 """
 
+SCROLLBAR_STYLE = """
+    QScrollBar:vertical {
+        border: none;
+        background: #f0f0f0;
+        width: 14px;
+        margin: 0px;
+        border-radius: 0px;
+    }
+    QScrollBar::handle:vertical {
+        background: #c0c0c0;
+        min-height: 30px;
+        border-radius: 7px;
+        margin: 2px;
+    }
+    QScrollBar::handle:vertical:hover {
+        background: #a0a0a0;
+    }
+    QScrollBar::handle:vertical:pressed {
+        background: #808080;
+    }
+    QScrollBar::sub-line:vertical {
+        height: 0px;
+    }
+    QScrollBar::add-line:vertical {
+        height: 0px;
+    }
+    QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
+        background: none;
+    }
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+        background: none;
+    }
+
+    QScrollBar:horizontal {
+        border: none;
+        background: #f0f0f0;
+        height: 14px;
+        margin: 0px;
+        border-radius: 0px;
+    }
+    QScrollBar::handle:horizontal {
+        background: #c0c0c0;
+        min-width: 30px;
+        border-radius: 7px;
+        margin: 2px;
+    }
+    QScrollBar::handle:horizontal:hover {
+        background: #a0a0a0;
+    }
+    QScrollBar::handle:horizontal:pressed {
+        background: #808080;
+    }
+    QScrollBar::sub-line:horizontal {
+        width: 0px;
+    }
+    QScrollBar::add-line:horizontal {
+        width: 0px;
+    }
+    QScrollBar::left-arrow:horizontal, QScrollBar::right-arrow:horizontal {
+        background: none;
+    }
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+        background: none;
+    }
+"""
+
 
 class DrawingScene(QGraphicsScene):
     def __init__(self, parent=None):
@@ -57,7 +126,11 @@ class DrawingScene(QGraphicsScene):
         self.current_tool = None
         self.drawing = False
         self.erasing = False
+        self.selecting = False
         self.current_path_item = None
+        self.selection_rect_item = None
+        self.selection_start_pos = None
+        self.last_point = None
 
     def mousePressEvent(self, event):
         if self.current_tool == "pen" and event.button() == Qt.MouseButton.LeftButton:
@@ -66,12 +139,20 @@ class DrawingScene(QGraphicsScene):
             self.current_path_item.setPos(event.scenePos())
             path = QPainterPath()
             path.moveTo(0, 0)
+            path.lineTo(0.1, 0)
             self.current_path_item.setPath(path)
+            self.last_point = QPointF(0, 0)
 
-            pen = QPen(Qt.GlobalColor.black, 2)
+            pen = QPen(QColor(0, 0, 0), 3)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             self.current_path_item.setPen(pen)
+            self.current_path_item.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True
+            )
+            self.current_path_item.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True
+            )
 
             self.addItem(self.current_path_item)
             event.accept()
@@ -82,6 +163,26 @@ class DrawingScene(QGraphicsScene):
             self.erasing = True
             self.erase_at(event.scenePos())
             event.accept()
+        elif (
+            self.current_tool == "rect" and event.button() == Qt.MouseButton.LeftButton
+        ):
+            item = self.itemAt(event.scenePos(), QTransform())
+            if item and item.isSelected():
+                super().mousePressEvent(event)
+            else:
+                self.clearSelection()
+                self.selecting = True
+                self.selection_start_pos = event.scenePos()
+                self.selection_rect_item = QGraphicsRectItem()
+                self.selection_rect_item.setPen(
+                    QPen(Qt.GlobalColor.black, 1, Qt.PenStyle.DashLine)
+                )
+                self.selection_rect_item.setBrush(QBrush(QColor(0, 0, 255, 50)))
+                self.selection_rect_item.setRect(
+                    QRectF(self.selection_start_pos, self.selection_start_pos)
+                )
+                self.addItem(self.selection_rect_item)
+                event.accept()
         else:
             super().mousePressEvent(event)
 
@@ -89,25 +190,57 @@ class DrawingScene(QGraphicsScene):
         if self.drawing and self.current_path_item:
             path = self.current_path_item.path()
             pos = self.current_path_item.mapFromScene(event.scenePos())
-            path.lineTo(pos)
+
+            if QLineF(self.last_point, pos).length() < 4:
+                return
+
+            mid_point = (self.last_point + pos) / 2
+            path.quadTo(self.last_point, mid_point)
+            self.last_point = pos
             self.current_path_item.setPath(path)
             event.accept()
         elif self.erasing:
             self.erase_at(event.scenePos())
+            event.accept()
+        elif self.selecting and self.selection_rect_item:
+            rect = QRectF(self.selection_start_pos, event.scenePos()).normalized()
+            self.selection_rect_item.setRect(rect)
             event.accept()
         else:
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self.drawing and event.button() == Qt.MouseButton.LeftButton:
+            if self.current_path_item:
+                path = self.current_path_item.path()
+                path.lineTo(self.last_point)
+                self.current_path_item.setPath(path)
             self.drawing = False
             self.current_path_item = None
             event.accept()
         elif self.erasing and event.button() == Qt.MouseButton.LeftButton:
             self.erasing = False
             event.accept()
+        elif self.selecting and event.button() == Qt.MouseButton.LeftButton:
+            self.selecting = False
+            if self.selection_rect_item:
+                rect = self.selection_rect_item.rect()
+                items = self.items(rect, Qt.ItemSelectionMode.ContainsItemShape)
+                for item in items:
+                    if item != self.selection_rect_item:
+                        item.setSelected(True)
+                self.removeItem(self.selection_rect_item)
+                self.selection_rect_item = None
+            event.accept()
         else:
             super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            for item in self.selectedItems():
+                self.removeItem(item)
+        else:
+            super().keyPressEvent(event)
 
     def erase_at(self, position):
         eraser_size = 20
@@ -130,12 +263,21 @@ class DrawingView(QGraphicsView):
         self.setScene(self.scene)
         self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self._tool_cursor = Qt.CursorShape.ArrowCursor
+        self.setBackgroundBrush(QBrush(QColor(255, 255, 255)))
 
         self.scene.changed.connect(self.update_scene_rect)
 
-    def set_tool(self, tool_id):
+    def set_tool(self, tool_id, cursor=None):
         self.scene.current_tool = tool_id
+        if cursor:
+            self._tool_cursor = cursor
+            self.setCursor(cursor)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -153,6 +295,35 @@ class DrawingView(QGraphicsView):
     def setCursor(self, cursor):
         super().setCursor(cursor)
         self.viewport().setCursor(cursor)
+
+    def mousePressEvent(self, event):
+        if (
+            self.scene.current_tool == "rect"
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            item = self.scene.itemAt(self.mapToScene(event.pos()), QTransform())
+            if item and item.isSelected():
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        if self.scene.current_tool == "rect":
+            if not event.buttons() & Qt.MouseButton.LeftButton:
+                item = self.scene.itemAt(self.mapToScene(event.pos()), QTransform())
+                if item and item.isSelected():
+                    self.setCursor(Qt.CursorShape.OpenHandCursor)
+                else:
+                    self.setCursor(self._tool_cursor)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self.scene.current_tool == "rect":
+            item = self.scene.itemAt(self.mapToScene(event.pos()), QTransform())
+            if item and item.isSelected():
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setCursor(self._tool_cursor)
 
 
 class MainWindow(QMainWindow):
@@ -174,7 +345,7 @@ class MainWindow(QMainWindow):
         splitter.setHandleWidth(3)
 
         self.left_pane = DrawingView()
-        self.left_pane.setStyleSheet("background-color: #ffffff;")
+        self.left_pane.setStyleSheet(SCROLLBAR_STYLE)
 
         self.left_pane.setCursor(self.cursors["default"])
 
@@ -207,8 +378,9 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.left_pane)
         splitter.addWidget(self.right_pane)
 
-        splitter.setStretchFactor(0, 9)
-        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([840, 360])
+        splitter.setStretchFactor(0, 7)
+        splitter.setStretchFactor(1, 3)
 
         self.setCentralWidget(splitter)
         self.show()
@@ -267,16 +439,17 @@ class MainWindow(QMainWindow):
             if btn != clicked_btn:
                 btn.setChecked(False)
 
+        if hasattr(self.left_pane, "scene"):
+            self.left_pane.scene.clearSelection()
+
         if not clicked_btn.isChecked():
-            self.left_pane.setCursor(self.cursors["default"])
             if hasattr(self.left_pane, "set_tool"):
-                self.left_pane.set_tool("default")
+                self.left_pane.set_tool("default", self.cursors["default"])
             return
 
         if tool_id in self.cursors:
-            self.left_pane.setCursor(self.cursors[tool_id])
             if hasattr(self.left_pane, "set_tool"):
-                self.left_pane.set_tool(tool_id)
+                self.left_pane.set_tool(tool_id, self.cursors[tool_id])
 
     def _create_pen_cursor(self):
         pixmap = QPixmap(32, 32)
