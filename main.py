@@ -1,4 +1,8 @@
 import sys
+import time
+import json
+import os
+import analyze
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -12,6 +16,9 @@ from PyQt6.QtWidgets import (
     QGraphicsPathItem,
     QGraphicsRectItem,
     QGraphicsItem,
+    QRadioButton,
+    QButtonGroup,
+    QLabel,
 )
 from PyQt6.QtCore import Qt, QRectF, QPointF, QLineF
 from PyQt6.QtGui import (
@@ -50,6 +57,18 @@ BUTTON_STYLE = """
     QToolButton:checked {
         background-color: #7289da; /* Blue highlight when selected */
         color: white;
+    }
+"""
+
+RADIO_STYLE = """
+    QRadioButton {
+        color: white;
+        font-size: 14px;
+        padding: 4px;
+    }
+    QRadioButton::indicator {
+        width: 14px;
+        height: 14px;
     }
 """
 
@@ -120,10 +139,18 @@ SCROLLBAR_STYLE = """
 """
 
 
+class StrokeItem(QGraphicsPathItem):
+    def __init__(self, label="text", parent=None):
+        super().__init__(parent)
+        self.stroke_data = []
+        self.label = label
+
+
 class DrawingScene(QGraphicsScene):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_tool = None
+        self.current_label = "text"
         self.drawing = False
         self.erasing = False
         self.selecting = False
@@ -135,13 +162,14 @@ class DrawingScene(QGraphicsScene):
     def mousePressEvent(self, event):
         if self.current_tool == "pen" and event.button() == Qt.MouseButton.LeftButton:
             self.drawing = True
-            self.current_path_item = QGraphicsPathItem()
+            self.current_path_item = StrokeItem(label=self.current_label)
             self.current_path_item.setPos(event.scenePos())
             path = QPainterPath()
             path.moveTo(0, 0)
-            path.lineTo(0.1, 0)
             self.current_path_item.setPath(path)
             self.last_point = QPointF(0, 0)
+            # Record start point and time
+            self.current_path_item.stroke_data.append((0.0, 0.0, time.time()))
 
             pen = QPen(QColor(0, 0, 0), 3)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -188,15 +216,17 @@ class DrawingScene(QGraphicsScene):
 
     def mouseMoveEvent(self, event):
         if self.drawing and self.current_path_item:
-            path = self.current_path_item.path()
             pos = self.current_path_item.mapFromScene(event.scenePos())
 
-            if QLineF(self.last_point, pos).length() < 4:
+            if (pos - self.last_point).manhattanLength() < 4.0:
                 return
 
+            path = self.current_path_item.path()
             mid_point = (self.last_point + pos) / 2
             path.quadTo(self.last_point, mid_point)
+
             self.last_point = pos
+            self.current_path_item.stroke_data.append((pos.x(), pos.y(), time.time()))
             self.current_path_item.setPath(path)
             event.accept()
         elif self.erasing:
@@ -213,8 +243,14 @@ class DrawingScene(QGraphicsScene):
         if self.drawing and event.button() == Qt.MouseButton.LeftButton:
             if self.current_path_item:
                 path = self.current_path_item.path()
-                path.lineTo(self.last_point)
+                # Record end point and time
+                pos = self.current_path_item.mapFromScene(event.scenePos())
+                path.lineTo(pos)
+                self.current_path_item.stroke_data.append(
+                    (pos.x(), pos.y(), time.time())
+                )
                 self.current_path_item.setPath(path)
+                self.smooth_stroke(self.current_path_item)
             self.drawing = False
             self.current_path_item = None
             event.accept()
@@ -254,6 +290,43 @@ class DrawingScene(QGraphicsScene):
         for item in items_to_remove:
             if isinstance(item, QGraphicsPathItem):
                 self.removeItem(item)
+
+    def smooth_stroke(self, stroke_item):
+        data = stroke_item.stroke_data
+        if len(data) < 2:
+            return
+
+        path = QPainterPath()
+        path.moveTo(data[0][0], data[0][1])
+
+        for i in range(1, len(data)):
+            p_last = QPointF(data[i - 1][0], data[i - 1][1])
+            p_curr = QPointF(data[i][0], data[i][1])
+            mid = (p_last + p_curr) / 2.0
+            path.quadTo(p_last, mid)
+
+        path.lineTo(data[-1][0], data[-1][1])
+        stroke_item.setPath(path)
+
+    def get_absolute_vectors(self):
+        vectors = []
+        for item in self.items():
+            if isinstance(item, QGraphicsPathItem):
+                path = item.path()
+                item_x = item.pos().x()
+                item_y = item.pos().y()
+
+                stroke_points = []
+                for i in range(path.elementCount()):
+                    element = path.elementAt(i)
+                    scene_x = element.x + item_x
+                    scene_y = element.y + item_y
+                    stroke_points.append((scene_x, scene_y))
+
+                if stroke_points:
+                    vectors.append(stroke_points)
+
+        return vectors[::-1]
 
 
 class DrawingView(QGraphicsView):
@@ -333,6 +406,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Drawtex")
         self.resize(1200, 800)
 
+        # FLAG: Set mode and label here!
+        self.data_collection_mode = True
+
         # Custom cursors
         self.cursors = {
             "default": Qt.CursorShape.ArrowCursor,
@@ -368,6 +444,10 @@ class MainWindow(QMainWindow):
         self.toolbar_widget.setGraphicsEffect(shadow)
 
         self.left_layout.addWidget(self.toolbar_widget)
+
+        if self.data_collection_mode:
+            self.label_toolbar = self.create_label_toolbar()
+            self.left_layout.addWidget(self.label_toolbar)
 
         self.left_layout.addStretch()
 
@@ -430,6 +510,41 @@ class MainWindow(QMainWindow):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             layout.addWidget(btn)
 
+        analyze_btn = QToolButton()
+        analyze_btn.setText("🧠")
+        analyze_btn.setToolTip("Analyze")
+        analyze_btn.setStyleSheet(BUTTON_STYLE)
+        analyze_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        analyze_btn.clicked.connect(self.run_analysis)
+        layout.addWidget(analyze_btn)
+
+        return container
+
+    def create_label_toolbar(self):
+        container = QFrame()
+        container.setStyleSheet(TOOLBAR_CONTAINER_STYLE)
+        container.setFixedWidth(100)
+
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(5)
+
+        lbl = QLabel("Label:")
+        lbl.setStyleSheet("color: #aaaaaa; font-weight: bold; font-size: 12px;")
+        layout.addWidget(lbl)
+
+        self.label_group = QButtonGroup(self)
+        modes = ["text", "math", "diagram"]
+
+        for mode in modes:
+            rb = QRadioButton(mode.capitalize())
+            rb.setStyleSheet(RADIO_STYLE)
+            layout.addWidget(rb)
+            self.label_group.addButton(rb)
+            if mode == "text":
+                rb.setChecked(True)
+
+        self.label_group.buttonToggled.connect(self.update_label_mode)
         return container
 
     def change_tool(self, tool_id, clicked_btn):
@@ -450,6 +565,67 @@ class MainWindow(QMainWindow):
         if tool_id in self.cursors:
             if hasattr(self.left_pane, "set_tool"):
                 self.left_pane.set_tool(tool_id, self.cursors[tool_id])
+
+    def update_label_mode(self, btn, checked):
+        if checked:
+            self.left_pane.scene.current_label = btn.text().lower()
+
+    def run_analysis(self):
+        if self.data_collection_mode:
+            collected_strokes = []
+            # items() returns items in descending stacking order (top first).
+            # We reverse it to get chronological order (bottom first).
+            items = list(self.left_pane.scene.items())
+            items.reverse()
+
+            for item in items:
+                if isinstance(item, StrokeItem):
+                    # Convert local coordinates to absolute scene coordinates
+                    scene_pos = item.pos()
+                    abs_stroke = [
+                        (x + scene_pos.x(), y + scene_pos.y(), t)
+                        for x, y, t in item.stroke_data
+                    ]
+                    collected_strokes.append(
+                        {"label": item.label, "points": abs_stroke}
+                    )
+
+            data_entry = {
+                "session_timestamp": time.time(),
+                "strokes": collected_strokes,
+            }
+            self._save_to_json(data_entry)
+            self.left_pane.scene.clear()
+            return
+
+        strokes = []
+        # items() returns items in descending stacking order (top first).
+        # We reverse it to get chronological order (bottom first).
+        items = list(self.left_pane.scene.items())
+        items.reverse()
+
+        for item in items:
+            if isinstance(item, StrokeItem):
+                strokes.append(item.stroke_data)
+
+        analyze.analyze_vectors(window.left_pane.scene.get_absolute_vectors())
+
+    def _save_to_json(self, entry):
+        filename = "collected_strokes.json"
+        data = []
+
+        if os.path.exists(filename):
+            try:
+                with open(filename, "r") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError:
+                data = []
+
+        data.append(entry)
+
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=4)
+        print(f"Saved data to {filename}")
 
     def _create_pen_cursor(self):
         pixmap = QPixmap(32, 32)
