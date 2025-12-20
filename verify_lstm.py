@@ -1,237 +1,224 @@
+import json
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
-import json
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-import os
+from torch.utils.data import DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import f1_score, classification_report
+from scipy.stats import mode
 
-# --- Constants (Must match training) ---
-WINDOW_SIZE = 50
-STRIDE = 2
-BATCH_SIZE = 32
-HIDDEN_DIM = 128
-INPUT_DIM = 7  # Updated for new features
+# ==========================================
+# CONFIGURATION (Must match training script)
+# ==========================================
+MODEL_PATH = "0_9163_best_model.pth"
+TEST_FILE = "validation_data.json"
 LABEL_MAP = {"text": 0, "math": 1, "diagram": 2}
-IDX_TO_LABEL = {v: k for k, v in LABEL_MAP.items()}
+REVERSE_LABEL_MAP = {0: "text", 1: "math", 2: "diagram"}
+INPUT_DIM = 9
+HIDDEN_DIM = 64
+OUTPUT_DIM = 3
+BATCH_SIZE = 1  # Inference is usually done 1 doc at a time, or small batches
+
+# ==========================================
+# CLASSES & FUNCTIONS
+# ==========================================
 
 
-# --- Model Definition ---
-class StrokeBiLSTM(nn.Module):
-    def __init__(self):
-        super(StrokeBiLSTM, self).__init__()
+class StrokeClassifierLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(StrokeClassifierLSTM, self).__init__()
         self.lstm = nn.LSTM(
-            input_size=INPUT_DIM,
-            hidden_size=HIDDEN_DIM,
-            num_layers=2,
+            input_size=input_dim,
+            hidden_size=hidden_dim,
             batch_first=True,
             bidirectional=True,
-            dropout=0.3,
+            num_layers=2,
+            dropout=0.2,
         )
-        self.fc = nn.Linear(HIDDEN_DIM * 2, 3)
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
 
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        return self.fc(lstm_out)
+    def forward(self, x, lengths):
+        packed_x = torch.nn.utils.rnn.pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=True
+        )
+        packed_out, _ = self.lstm(packed_x)
+        lstm_out, _ = torch.nn.utils.rnn.pad_packed_sequence(
+            packed_out, batch_first=True
+        )
+        logits = self.fc(lstm_out)
+        return logits
 
 
-# --- Feature Extraction (Robust Version) ---
-def extract_features(points, prev_end_point):
-    if not points or len(points) < 2:
-        return np.zeros(INPUT_DIM, dtype=np.float32)
+def smooth_predictions(preds, window_size=5):
+    if len(preds) < window_size:
+        return preds
+    smoothed = np.copy(preds)
+    half_window = window_size // 2
+    for i in range(len(preds)):
+        start = max(0, i - half_window)
+        end = min(len(preds), i + half_window + 1)
+        window = preds[start:end]
+        val = mode(window, keepdims=False)[0]
+        smoothed[i] = val
+    return smoothed
 
-    pts = np.array([p[:2] for p in points])
-    times = np.array([p[2] for p in points])
 
-    deltas = np.diff(pts, axis=0)
-    segment_dists = np.sqrt((deltas**2).sum(axis=1))
+def extract_features(session_data):
+    strokes = session_data.get("strokes", [])
+    features = []
+    labels = []
 
-    start_x, start_y = pts[0]
-    path_len = np.sum(segment_dists)
+    prev_end_x = 0
+    prev_end_y = 0
+    prev_end_t = strokes[0]["points"][0][2] if strokes and strokes[0]["points"] else 0
 
-    # Robust Width/Height
-    width = np.clip((np.max(pts[:, 0]) - np.min(pts[:, 0])) / 100.0, 0, 5.0)
-    height = np.clip((np.max(pts[:, 1]) - np.min(pts[:, 1])) / 100.0, 0, 5.0)
+    for stroke in strokes:
+        points = np.array(stroke["points"])
+        if len(points) == 0:
+            continue
 
-    straight_dist = np.linalg.norm(pts[-1] - pts[0])
-    linearity = straight_dist / (path_len + 1e-6)
+        xs, ys, ts = points[:, 0], points[:, 1], points[:, 2]
 
-    if prev_end_point is not None:
-        p_x, p_y, p_t = prev_end_point
-        # Robust dx/dy
-        dx = (start_x - p_x) / 100.0
-        dy = (start_y - p_y) / 100.0
-        dx = np.clip(dx, -3.0, 3.0)
-        dy = np.clip(dy, -3.0, 3.0)
+        dx_prev = xs[0] - prev_end_x
+        dy_prev = ys[0] - prev_end_y
+        dt_prev = ts[0] - prev_end_t
+        width = np.max(xs) - np.min(xs)
+        height = np.max(ys) - np.min(ys)
+        duration = ts[-1] - ts[0]
+        num_points = len(points)
 
-        dt = times[0] - p_t
-        if dt > 5.0:
-            dt = 5.0
-        if dt < 0.01:
-            dt = 0.01
-    else:
-        dx, dy, dt = 0.0, 0.0, 0.0
+        path_length = np.sum(np.sqrt(np.diff(xs) ** 2 + np.diff(ys) ** 2)) + 1e-6
+        euclidean_dist = np.sqrt((xs[-1] - xs[0]) ** 2 + (ys[-1] - ys[0]) ** 2)
+        linearity = euclidean_dist / path_length
+        speed = path_length / (duration + 1e-6)
 
-    angle = np.arctan2(dy, dx)
-    feat_sin = np.sin(angle)
-    feat_cos = np.cos(angle)
-
-    # New Features
-    raw_dist = np.linalg.norm(
-        [
-            start_x - (prev_end_point[0] if prev_end_point else start_x),
-            start_y - (prev_end_point[1] if prev_end_point else start_y),
-        ]
-    )
-    speed = raw_dist / (dt + 1e-5)
-    log_speed = np.log1p(speed)
-
-    segment_angles = np.arctan2(deltas[:, 1], deltas[:, 0])
-    angle_changes = np.diff(segment_angles)
-    angle_changes = np.arctan2(np.sin(angle_changes), np.cos(angle_changes))
-    total_curvature = np.sum(np.abs(angle_changes))
-    total_curvature = np.clip(total_curvature / 10.0, 0, 5.0)
-
-    log_len = np.log1p(path_len)
-    log_len = np.clip(log_len / 5.0, 0, 2.0)
-
-    return np.array(
-        [
-            dx,
-            dy,
-            dt,
+        stroke_vec = [
+            dx_prev,
+            dy_prev,
+            dt_prev,
             width,
             height,
+            duration,
+            num_points,
             linearity,
-            path_len / 100.0,
-            feat_sin,
-            feat_cos,
-            log_speed,
-            total_curvature,
-            log_len,
-        ],
-        dtype=np.float32,
+            speed,
+        ]
+        features.append(stroke_vec)
+        labels.append(LABEL_MAP.get(stroke.get("label", "text"), 0))
+
+        prev_end_x = xs[-1]
+        prev_end_y = ys[-1]
+        prev_end_t = ts[-1]
+
+    return np.array(features, dtype=np.float32), np.array(labels, dtype=np.int64)
+
+
+def pad_sequence(batch):
+    # Sort by length
+    batch.sort(key=lambda x: x[0].shape[0], reverse=True)
+    features = [torch.tensor(x[0]) for x in batch]
+    labels = [torch.tensor(x[1]) for x in batch]
+    lengths = torch.tensor([len(f) for f in features])
+
+    features_padded = torch.nn.utils.rnn.pad_sequence(
+        features, batch_first=True, padding_value=0
+    )
+    labels_padded = torch.nn.utils.rnn.pad_sequence(
+        labels, batch_first=True, padding_value=-1
     )
 
-
-def prepare_windows(sessions):
-    all_windows_X = []
-    all_windows_Y = []
-    continuous_feats = []
-    continuous_labels = []
-
-    for session in sessions:
-        prev_end = None
-        for stroke in session["strokes"]:
-            label_id = LABEL_MAP.get(stroke.get("label", "text"), 0)
-            raw_points = stroke["points"]
-            feat = extract_features(raw_points, prev_end)
-            continuous_feats.append(feat)
-            continuous_labels.append(label_id)
-            if raw_points:
-                last_p = raw_points[-1]
-                prev_end = (last_p[0], last_p[1], last_p[2])
-
-    num_total_strokes = len(continuous_feats)
-    for i in range(0, num_total_strokes, STRIDE):
-        end_idx = i + WINDOW_SIZE
-        if end_idx <= num_total_strokes:
-            window_x = continuous_feats[i:end_idx]
-            window_y = continuous_labels[i:end_idx]
-            all_windows_X.append(window_x)
-            all_windows_Y.append(window_y)
-        else:
-            window_x = continuous_feats[i:end_idx]
-            window_y = continuous_labels[i:end_idx]
-            current_len = len(window_x)
-            if current_len > 0:
-                pad_len = WINDOW_SIZE - current_len
-                padding_x = [
-                    np.zeros(INPUT_DIM, dtype=np.float32) for _ in range(pad_len)
-                ]
-                window_x.extend(padding_x)
-                padding_y = [-1 for _ in range(pad_len)]
-                window_y.extend(padding_y)
-                all_windows_X.append(window_x)
-                all_windows_Y.append(window_y)
-
-    return np.array(all_windows_X), np.array(all_windows_Y)
+    return features_padded, labels_padded, lengths
 
 
-# --- Main Evaluation Loop ---
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
 if __name__ == "__main__":
-    validation_file = "validation_data.json"
-    model_path = "0.8738_stroke_lstm_best.pth"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     # 1. Load Data
-    if not os.path.exists(validation_file):
-        print(f"Error: {validation_file} not found.")
+    try:
+        with open(TEST_FILE, "r") as f:
+            raw_sessions = json.load(f)
+        print(f"Loaded {len(raw_sessions)} sessions from {TEST_FILE}")
+    except FileNotFoundError:
+        print(f"Error: {TEST_FILE} not found.")
         exit()
 
-    print(f"Loading {validation_file}...")
-    with open(validation_file, "r") as f:
-        val_sessions = json.load(f)
+    X_list = []
+    Y_list = []
 
-    # 2. Process Data
-    print("Processing windows...")
-    X_val, Y_val = prepare_windows(val_sessions)
-    print(f"Generated {len(X_val)} windows.")
+    # Keep track of original session indices if needed for debugging
+    for session in raw_sessions:
+        feats, labs = extract_features(session)
+        if len(feats) > 0:
+            X_list.append(feats)
+            Y_list.append(labs)
 
-    # 3. Setup DataLoader
-    val_ds = TensorDataset(
-        torch.tensor(X_val, dtype=torch.float32),
-        torch.tensor(Y_val, dtype=torch.long),
+    if not X_list:
+        print("No valid stroke data found.")
+        exit()
+
+    # 2. Normalize (Fit Scaler on this batch - see note in intro)
+    all_features = np.vstack(X_list)
+    scaler = StandardScaler()
+    scaler.fit(all_features)
+    X_list_normalized = [scaler.transform(x) for x in X_list]
+
+    # 3. Prepare Loader
+    data = list(zip(X_list_normalized, Y_list))
+    loader = DataLoader(
+        data, batch_size=BATCH_SIZE, collate_fn=pad_sequence, shuffle=False
     )
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     # 4. Load Model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = StrokeBiLSTM().to(device)
-
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        print(f"Loaded model from {model_path}")
-    else:
-        print("Error: Model file not found.")
+    model = StrokeClassifierLSTM(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM).to(device)
+    try:
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        print("Model weights loaded successfully.")
+    except FileNotFoundError:
+        print(f"Error: {MODEL_PATH} not found.")
         exit()
 
-    # 5. Inference
+    # 5. Inference Loop
     model.eval()
     all_preds = []
     all_targets = []
 
-    print("Running inference...")
+    print("\nRunning Inference...")
+
     with torch.no_grad():
-        for bx, by in val_loader:
-            bx, by = bx.to(device), by.to(device)
-            out = model(bx)
+        for batch_i, (batch_x, batch_y, batch_lengths) in enumerate(loader):
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
 
-            # Reshape for classification
-            flat_out = out.view(-1, 3)
-            flat_y = by.view(-1)
+            logits = model(batch_x, batch_lengths)
+            preds = torch.argmax(logits, dim=2)
 
-            # Mask padding (-1)
-            mask = flat_y != -1
+            # Process per document in batch
+            for i in range(len(batch_y)):
+                length = batch_lengths[i].item()
 
-            preds = torch.argmax(flat_out, dim=1)
+                # Get raw sequences
+                raw_pred = preds[i, :length].cpu().numpy()
+                target = batch_y[i, :length].cpu().numpy()
 
-            all_preds.extend(preds[mask].cpu().numpy())
-            all_targets.extend(flat_y[mask].cpu().numpy())
+                # Apply Smoothing
+                smoothed_pred = smooth_predictions(raw_pred, window_size=5)
 
-    # 6. Report
-    print("\n" + "=" * 30)
-    print("FINAL VALIDATION RESULTS")
-    print("=" * 30)
+                all_preds.extend(smoothed_pred)
+                all_targets.extend(target)
 
-    acc = accuracy_score(all_targets, all_preds)
-    print(f"Accuracy: {acc:.4f}\n")
-
-    print("Classification Report:")
+    # 6. Final Report
+    score = f1_score(all_targets, all_preds, average="weighted")
+    print("-" * 30)
+    print(f"Weighted F1 Score: {score:.4f}")
+    print("-" * 30)
+    print("\nDetailed Report:")
     print(
         classification_report(
-            all_targets, all_preds, target_names=list(LABEL_MAP.keys())
+            all_targets, all_preds, target_names=["Text", "Math", "Diagram"]
         )
     )
-
-    print("\nConfusion Matrix:")
-    print(confusion_matrix(all_targets, all_preds))

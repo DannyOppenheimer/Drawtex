@@ -611,7 +611,7 @@ class MainWindow(QMainWindow):
         analyze.analyze_vectors(window.left_pane.scene.get_absolute_vectors())
 
     def _save_to_json(self, entry):
-        filename = "collected_strokes.json.json"
+        filename = "validation_data.json"
         data = []
 
         if os.path.exists(filename):
