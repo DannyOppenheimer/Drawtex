@@ -218,6 +218,11 @@ if __name__ == "__main__":
     scaler.fit(all_features)
     X_list_normalized = [scaler.transform(x) for x in X_list]
 
+    import joblib
+
+    joblib.dump(scaler, "scaler.save")  # <--- ADD THIS
+    print("Scaler saved to 'scaler.save'")
+
     data = list(zip(X_list_normalized, Y_list))
     train_data, val_data = train_test_split(data, test_size=0.2, random_state=42)
 

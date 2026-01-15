@@ -311,18 +311,13 @@ class DrawingScene(QGraphicsScene):
     def get_absolute_vectors(self):
         vectors = []
         for item in self.items():
-            if isinstance(item, QGraphicsPathItem):
-                path = item.path()
+            if isinstance(item, StrokeItem):
                 item_x = item.pos().x()
                 item_y = item.pos().y()
 
                 stroke_points = []
-                for i in range(path.elementCount()):
-                    element = path.elementAt(i)
-                    scene_x = element.x + item_x
-                    scene_y = element.y + item_y
-                    stroke_points.append((scene_x, scene_y))
-
+                for x, y, t in item.stroke_data:
+                    stroke_points.append((x + item_x, y + item_y, t))
                 if stroke_points:
                     vectors.append(stroke_points)
 
@@ -407,7 +402,7 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         # FLAG: Set mode and label here!
-        self.data_collection_mode = True
+        self.data_collection_mode = False
 
         # Custom cursors
         self.cursors = {
