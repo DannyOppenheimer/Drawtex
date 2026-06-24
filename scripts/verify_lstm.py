@@ -14,7 +14,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import f1_score, classification_report
 
 from models.lstm import StrokeClassifierLSTM
-from models.feature_extraction import extract_features, pad_sequence, smooth_predictions
+from models.feature_extraction import (
+    INPUT_DIM,
+    extract_features,
+    pad_sequence,
+    smooth_predictions,
+)
 
 # ==========================================
 # CONFIGURATION (Must match training script)
@@ -23,7 +28,6 @@ MODEL_PATH = str(PROJECT_ROOT / "weights" / "0_9163_best_model.pth")
 TEST_FILE = str(PROJECT_ROOT / "data" / "validation_data.json")
 LABEL_MAP = {"text": 0, "math": 1, "diagram": 2}
 REVERSE_LABEL_MAP = {0: "text", 1: "math", 2: "diagram"}
-INPUT_DIM = 9
 HIDDEN_DIM = 64
 OUTPUT_DIM = 3
 BATCH_SIZE = 1  # Inference is usually done 1 doc at a time, or small batches

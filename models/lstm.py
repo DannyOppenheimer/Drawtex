@@ -13,7 +13,12 @@ class StrokeClassifierLSTM(nn.Module):
             num_layers=2,
             dropout=0.2,
         )
+        self.dropout = nn.Dropout(0.3)
         self.fc = nn.Linear(hidden_dim * 2, output_dim)
+
+        for name, param in self.lstm.named_parameters():
+            if "weight_hh" in name:
+                nn.init.orthogonal_(param)
 
     def forward(self, x, lengths):
         packed_x = torch.nn.utils.rnn.pack_padded_sequence(
@@ -23,5 +28,5 @@ class StrokeClassifierLSTM(nn.Module):
         lstm_out, _ = torch.nn.utils.rnn.pad_packed_sequence(
             packed_out, batch_first=True
         )
-        logits = self.fc(lstm_out)
+        logits = self.fc(self.dropout(lstm_out))
         return logits

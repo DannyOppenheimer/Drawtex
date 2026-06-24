@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import numpy as np
 from PIL import Image, ImageDraw
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
@@ -7,10 +6,19 @@ from scipy.stats import mode
 from sklearn.preprocessing import StandardScaler
 import warnings
 import os
+import sys
 import uuid
 import joblib
 from pathlib import Path
 from scipy.interpolate import splprep, splev
+
+# Make project root importable when this module is loaded as core.analyze
+_PROJECT_ROOT_FOR_IMPORT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT_FOR_IMPORT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT_FOR_IMPORT))
+
+from models.lstm import StrokeClassifierLSTM
+from models.feature_extraction import INPUT_DIM
 
 # Try to import Pix2Text (preferred), fallback to pix2tex
 try:
@@ -37,35 +45,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LSTM_MODEL_PATH = str(PROJECT_ROOT / "weights" / "0_9163_best_model.pth")
 SCALER_PATH = str(PROJECT_ROOT / "weights" / "scaler.save")
 DEBUG_FOLDER = str(PROJECT_ROOT / "debug_images")
-INPUT_DIM = 9  # Must match your trained model
 HIDDEN_DIM = 64
 OUTPUT_DIM = 3
 LABEL_MAP = {0: "text", 1: "math", 2: "diagram"}
-
-
-class StrokeClassifierLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(StrokeClassifierLSTM, self).__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            batch_first=True,
-            bidirectional=True,
-            num_layers=2,
-            dropout=0.2,
-        )
-        self.fc = nn.Linear(hidden_dim * 2, output_dim)
-
-    def forward(self, x, lengths):
-        packed_x = torch.nn.utils.rnn.pack_padded_sequence(
-            x, lengths.cpu(), batch_first=True, enforce_sorted=True
-        )
-        packed_out, _ = self.lstm(packed_x)
-        lstm_out, _ = torch.nn.utils.rnn.pad_packed_sequence(
-            packed_out, batch_first=True
-        )
-        logits = self.fc(lstm_out)
-        return logits
 
 
 # ==========================================
@@ -109,6 +91,7 @@ def extract_features_from_vectors(vectors):
         euclidean_dist = np.sqrt((xs[-1] - xs[0]) ** 2 + (ys[-1] - ys[0]) ** 2)
         linearity = euclidean_dist / path_length
         speed = path_length / (duration + 1e-6)
+        aspect_ratio = width / (height + 1e-6)
 
         stroke_vec = [
             dx_prev,
@@ -120,6 +103,7 @@ def extract_features_from_vectors(vectors):
             num_points,
             linearity,
             speed,
+            aspect_ratio,
         ]
         features.append(stroke_vec)
 
@@ -698,7 +682,7 @@ def analyze_vectors(vectors):
 
                     generated_ids = _text_model.generate(
                         pixel_values,
-                        num_beams=1,           # Greedy decoding — less word-correction bias
+                        num_beams=5,
                         repetition_penalty=1.5, # Reduce repeated characters
                     )
                     text = _text_processor.batch_decode(

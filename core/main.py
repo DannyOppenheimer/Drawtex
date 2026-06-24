@@ -1011,7 +1011,7 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         # FLAG: Set mode and label here!
-        self.data_collection_mode = False
+        self.data_collection_mode = True
 
         # Background worker for analysis
         self.analysis_worker = None

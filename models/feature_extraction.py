@@ -2,6 +2,12 @@ import numpy as np
 from scipy.stats import mode
 
 
+# Number of features produced per stroke by extract_features() and
+# extract_features_from_vectors(). Single source of truth — imported by
+# the LSTM training, verification, and inference code.
+INPUT_DIM = 10
+
+
 def smooth_predictions(preds, window_size=5):
     """
     Applies a majority vote sliding window to smooth predictions.
@@ -58,6 +64,7 @@ def extract_features(session_data):
 
         linearity = euclidean_dist / path_length
         speed = path_length / (duration + 1e-6)
+        aspect_ratio = width / (height + 1e-6)
 
         stroke_vec = [
             dx_prev,
@@ -69,6 +76,7 @@ def extract_features(session_data):
             num_points,
             linearity,
             speed,
+            aspect_ratio,
         ]
         features.append(stroke_vec)
         labels.append(LABEL_MAP.get(stroke.get("label", "text"), 0))
